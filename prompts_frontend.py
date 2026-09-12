@@ -1,34 +1,62 @@
 """
-prompts_frontend.py — one prompt per front-end stage.
+prompts_frontend.py — one prompt per front-end stage, shaped by the domain.
 
 Stages run in DEPENDENCY ORDER:
 
     scaffold -> models -> services -> guards -> components -> app
 
-Two changes matter most compared with the original prompts.
+Three things drive the design.
 
-First, every front-end stage is given the **real HTTP surface** extracted from
-the generated routers. Without it the front end infers URLs from the Gherkin
-and infers them differently from how the backend did, so everything compiles
-and every request 404s.
+**The real HTTP surface.** Every front-end stage is given the routes extracted
+from the generated backend. Without it the front end infers URLs from the
+Gherkin and infers them differently from how the backend did, so everything
+compiles and every request 404s.
 
-Second, the prompts require Angular's built-in control flow (`@if`, `@for`)
-rather than the structural directives. `*ngIf` and `*ngFor` need `CommonModule`
-in a standalone component's `imports`, and models forget that constantly —
-which is a compile error every time. The built-in syntax needs no import at
-all, so an entire class of generated-code failure disappears.
+**Angular's built-in control flow.** `*ngIf` and `*ngFor` need `CommonModule` in
+a standalone component's `imports`, and models forget that constantly — which is
+a compile error every time. `@if` and `@for` need no import at all, so an entire
+class of generated-code failure disappears.
+
+**The domain profile.** An application with no accounts gets no auth guard, no
+bearer-token interceptor and no role-dependent navigation. Asking for them
+anyway produces a sign-in screen for an application nobody signs into, and marks
+the stage failed when the model sensibly returns fewer files than a manifest
+written for somebody else's domain.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Callable
+
 import config
 import context
+from prompts_backend import Entry, minimum, render_manifest
+from domain_profile import Profile
 
-FRONTEND_SRC = config.FRONTEND_DIR / "src"
+
+def _frontend_src():
+    """
+    Resolved on every call, never at import.
+
+    This used to be a module-level constant, which silently froze the front-end
+    path to whatever project was configured at import time. With several
+    specifications in one process — which is exactly what running a comparison
+    across domains means — every project after the first wrote into the first
+    one's directory.
+    """
+    return config.FRONTEND_DIR / "src"
 
 
 # ============================================================ shared =======
-def _stack() -> str:
+def _stack(prof: Profile) -> str:
+    # The idioms table is included in every front-end prompt, so a row about
+    # functional guards reaches a domain with nothing to guard — which is enough
+    # on its own to make a model invent one. Rows appear only when the domain
+    # can use them.
+    guard_row = ("| Functional guards: `export const x: CanActivateFn = ...` | "
+                 "class guards implementing `CanActivate` |\n"
+                 if prof.authentication else "")
     return f"""\
 ## Technology, fixed — do not substitute
 
@@ -46,8 +74,7 @@ def _stack() -> str:
 | `inject(Service)` | constructor parameter injection |
 | `signal()`, `computed()`, `effect()` for component state | mutable public fields |
 | `input()` and `output()` functions | `@Input()` and `@Output()` decorators |
-| Functional guards: `export const x: CanActivateFn = ...` | class guards implementing `CanActivate` |
-| Functional interceptors: `HttpInterceptorFn` | class interceptors with `HTTP_INTERCEPTORS` |
+{guard_row}| Functional interceptors: `HttpInterceptorFn` | class interceptors with `HTTP_INTERCEPTORS` |
 | `provideHttpClient()`, `provideRouter()` in `app.config.ts` | `HttpClientModule`, `RouterModule.forRoot()` |
 | `loadComponent` / `loadChildren` for routes | eager imports of every page |
 
@@ -60,8 +87,8 @@ never inline `template:` or `styles:`.
 """
 
 
-def _output_contract(target_dir: str, manifest: str = "") -> str:
-    block = f"""\
+def _output_contract(target_dir: str, entries: list[Entry] | None = None) -> str:
+    block = """\
 ## Output contract
 
 Return **only** files, each in exactly this form:
@@ -75,7 +102,7 @@ COMPLETE FILE CONTENT
 Rules for the path:
 
 - It is relative to the project root, and **begins with `frontend/`**.
-- Example: `FILE: frontend/src/app/services/auth.service.ts`
+- Example: `FILE: frontend/src/app/services/item.service.ts`
 - Do not prefix it with `app/`, `./` or an absolute path.
 
 Rules for the content:
@@ -84,12 +111,17 @@ Rules for the content:
   fragment, not an excerpt.
 - A component means three files — `.ts`, `.html`, `.css` — each returned in
   full, each with its own `FILE:` line.
+- **Exactly one fenced block per `FILE:` line.** The block closes with a single
+  ``` and the next thing in your answer is either the next `FILE:` line or the
+  end. Do not add a usage example, a shell command, an explanation or a summary
+  after a file — a second fenced block under one `FILE:` line corrupts that
+  file.
 - No prose before the first `FILE:` line and none after the last closing fence.
 """
     if target_dir:
         block += f"\n- Every file in this stage belongs under `{target_dir}`.\n"
-    if manifest:
-        block += f"\n### Files to produce in this stage\n\n{manifest}\n"
+    if entries:
+        block += f"\n### Files to produce in this stage\n\n{render_manifest(entries)}\n"
     return block
 
 
@@ -173,48 +205,61 @@ return the complete changed file.
 """
 
 
-def _self_check() -> str:
-    return """\
-## Before you answer, check each of these
-
-1. Does every file I import exist, either in the context above or in this same
-   answer?
-2. Does every component I reference appear in the importing component's
-   `imports` array?
-3. Have I used `@if` and `@for` rather than `*ngIf` and `*ngFor`?
-4. Does every component have all three of its files, each complete?
-5. Does every HTTP call use a route from the HTTP surface section, verbatim?
-6. Is `any` absent, and does every service method declare its return type?
-7. Is every path in a `FILE:` line starting with `frontend/`?
-"""
+def _self_check(prof: Profile) -> str:
+    checks = [
+        "Does every file I import exist, either in the context above or in this "
+        "same answer?",
+        "Does every component I reference appear in the importing component's "
+        "`imports` array?",
+        "Have I used `@if` and `@for` rather than `*ngIf` and `*ngFor`?",
+        "Does every component have all three of its files, each complete?",
+        "Does every HTTP call use a route from the HTTP surface section, verbatim?",
+        "Is `any` absent, and does every service method declare its return type?",
+    ]
+    if prof.authentication:
+        checks.append("Have I remembered that a guard is a convenience, and that "
+                      "nothing here is a security boundary?")
+    checks.append("Is every path in a `FILE:` line starting with `frontend/`?")
+    body = "\n".join(f"{i}. {text}" for i, text in enumerate(checks, start=1))
+    return f"## Before you answer, check each of these\n\n{body}\n"
 
 
 def _assemble(*sections: str) -> str:
     return "\n\n".join(s.strip() for s in sections if s and s.strip()) + "\n"
 
 
+def _entity_floor(prof: Profile) -> int:
+    return max(1, round(prof.entities_hint / 3))
+
+
 # ========================================================= 1. scaffold ====
-def scaffold(spec: str) -> str:
-    manifest = """\
-- `frontend/package.json` — **do not produce `package-lock.json`**; it will be
-  generated by `npm install`
-- `frontend/angular.json` — with Bootstrap's CSS and Bootstrap Icons' CSS in
-  the `styles` array, and Bootstrap's JS bundle in `scripts`
-- `frontend/tsconfig.json`
-- `frontend/tsconfig.app.json`
-- `frontend/tsconfig.spec.json`
-- `frontend/.gitignore`
-- `frontend/src/index.html`
-- `frontend/src/main.ts`
-- `frontend/src/styles.css` — global styles and any Bootstrap overrides
-- `frontend/src/environments/environment.ts` — `apiUrl` for development
-- `frontend/src/environments/environment.production.ts`
-"""
+def scaffold_manifest(prof: Profile) -> list[Entry]:
+    return [
+        Entry("frontend/package.json",
+              "**do not produce `package-lock.json`**; it will be generated by "
+              "`npm install`"),
+        Entry("frontend/angular.json",
+              "with Bootstrap's CSS and Bootstrap Icons' CSS in the `styles` "
+              "array, and Bootstrap's JS bundle in `scripts`"),
+        Entry("frontend/tsconfig.json", "strict compiler settings"),
+        Entry("frontend/tsconfig.app.json", "application build settings"),
+        Entry("frontend/.gitignore", "node_modules, dist, .angular"),
+        Entry("frontend/src/index.html", "the host page"),
+        Entry("frontend/src/main.ts", "bootstrapApplication"),
+        Entry("frontend/src/styles.css", "global styles and any Bootstrap overrides"),
+        Entry("frontend/src/environments/environment.ts", "`apiUrl` for development"),
+        Entry("frontend/tsconfig.spec.json", "test settings", required=False),
+        Entry("frontend/src/environments/environment.production.ts",
+              "production `apiUrl`", required=False),
+    ]
+
+
+def scaffold(spec: str, prof: Profile) -> str:
     return _assemble(
         "# Task: generate the Angular project scaffold",
         "You are a senior Angular engineer. You write complete, compiling, "
         "production-quality code. You answer with code and nothing else.",
-        _stack(),
+        _stack(prof),
         f"""\
 ## This stage
 
@@ -242,21 +287,24 @@ are generated in the final stage; import them from `./app/app` and
 `./app/app.config` so the reference resolves once that stage runs.
 """,
         _hard_rules(),
-        _output_contract("frontend/", manifest),
+        _output_contract("frontend/", scaffold_manifest(prof)),
         _spec_block(spec),
         _code_block("Backend configuration — for the API base URL and CORS origin",
                     context.collect_code(config.BACKEND_DIR / "src" / "config")),
-        _self_check(),
+        _self_check(prof),
     )
 
 
 # =========================================================== 2. models ====
-def models(spec: str) -> str:
+def models(spec: str, prof: Profile) -> str:
+    secret_rule = ("- A field the backend removes before sending — a password "
+                   "hash, an internal flag — must not appear here at all.\n"
+                   if prof.authentication else "")
     return _assemble(
         "# Task: generate the front-end models",
         "You are a senior Angular engineer. You answer with code and nothing else.",
-        _stack(),
-        """\
+        _stack(prof),
+        f"""\
 ## This stage
 
 TypeScript interfaces and enums in `frontend/src/app/models/`, one file per
@@ -267,16 +315,14 @@ from the **backend models and controllers** shown below, not from guesswork:
 
 - Field names must match the backend's `toJSON` output exactly, including
   whether the identifier is `id` or `_id`.
-- A field the backend removes before sending — a password hash, an internal
-  flag — must not appear here at all.
-- Dates arrive as ISO strings over HTTP. Type them as `string`, and convert to
+{secret_rule}- Dates arrive as ISO strings over HTTP. Type them as `string`, and convert to
   `Date` in the component if you need to.
 - Where the backend uses an enumeration, declare the same enumeration here with
   the same string values.
 
 Also declare the request and response shapes the API uses: the body each POST
 and PUT sends, and the envelope each list endpoint returns, including the error
-shape `{ status, message, fieldErrors? }`.
+shape `{{ status, message, fieldErrors? }}`.
 
 No classes, no decorators — interfaces, type aliases and enums only.
 """,
@@ -284,25 +330,45 @@ No classes, no decorators — interfaces, type aliases and enums only.
         _output_contract("frontend/src/app/models/"),
         _spec_block(spec),
         _api_surface(),
-        _code_block("Backend models, types and controllers — the source of truth for these shapes",
+        _code_block("Backend models, types and controllers — the source of truth "
+                    "for these shapes",
                     context.collect_code(config.BACKEND_DIR / "src" / "models",
                                          config.BACKEND_DIR / "src" / "types",
                                          config.BACKEND_DIR / "src" / "controllers")),
-        _self_check(),
+        _self_check(prof),
     )
 
 
 # ========================================================= 3. services ====
-def services(spec: str) -> str:
+def services(spec: str, prof: Profile) -> str:
+    extra = []
+    if prof.authentication:
+        extra.append(
+            "- An authentication service holds the current user in a `signal` and "
+            "exposes it as a readonly signal. It persists the token, restores it "
+            "on start-up, and clears it on sign-out. It exposes `isAuthenticated`"
+            + (" and a role check" if prof.roles else "")
+            + " as `computed` signals, so guards and templates read the same "
+              "source.")
+    if prof.search:
+        extra.append(
+            "- A search method takes one typed criteria object and omits absent "
+            "filters from `HttpParams` entirely, rather than sending empty "
+            "strings the backend then has to interpret.")
+    if prof.uploads:
+        extra.append(
+            "- An upload sends `FormData` and does **not** set a `Content-Type` "
+            "header; the browser sets it with the multipart boundary, and "
+            "overriding it breaks the request.")
     return _assemble(
         "# Task: generate the front-end services",
         "You are a senior Angular engineer. You answer with code and nothing else.",
-        _stack(),
-        """\
+        _stack(prof),
+        f"""\
 ## This stage
 
 Injectable services in `frontend/src/app/services/`, one per feature area,
-named `<area>.service.ts`, each `@Injectable({ providedIn: 'root' })`.
+named `<area>.service.ts`, each `@Injectable({{ providedIn: 'root' }})`.
 
 Requirements:
 
@@ -312,11 +378,7 @@ Requirements:
   models stage. Explicit return type on every method.
 - Query parameters go through `HttpParams`, never string concatenation, so
   values are encoded correctly.
-- An authentication service, if the specification has authentication, holds the
-  current user in a `signal` and exposes it as a readonly signal. It persists
-  the token, restores it on start-up, and clears it on sign-out. It exposes
-  `isAuthenticated` and a role check as `computed` signals, so guards and
-  templates read the same source.
+{chr(10).join(extra)}
 - Do not catch errors here and turn them into empty results. Let them
   propagate; the interceptor and the components handle them. Swallowing an
   error is how a broken screen looks like an empty one.
@@ -328,32 +390,81 @@ Call only the routes in the HTTP surface section, exactly as written.
         _api_surface(),
         _spec_block(spec),
         _code_block("Front-end models and scaffold",
-                    context.collect_code(FRONTEND_SRC / "app" / "models",
-                                         FRONTEND_SRC / "environments")),
-        _self_check(),
+                    context.collect_code(_frontend_src() / "app" / "models",
+                                         _frontend_src() / "environments")),
+        _self_check(prof),
     )
 
 
 # =========================================== 4. guards and interceptors ===
-def guards(spec: str) -> str:
-    manifest = """\
-- `frontend/src/app/guards/auth.guard.ts` — a `CanActivateFn` that redirects an
-  unauthenticated visitor to the sign-in route
-- `frontend/src/app/guards/role.guard.ts` — a `CanActivateFn` factory taking the
-  allowed roles from the route's `data`
-- `frontend/src/app/guards/guest.guard.ts` — keeps a signed-in user off the
-  sign-in and registration routes
-- `frontend/src/app/interceptors/auth.interceptor.ts` — an `HttpInterceptorFn`
-  that attaches the bearer token
-- `frontend/src/app/interceptors/error.interceptor.ts` — an `HttpInterceptorFn`
-  that signs the user out on 401 and surfaces a readable message otherwise
+def guards_manifest(prof: Profile) -> list[Entry]:
+    entries = [
+        Entry("frontend/src/app/interceptors/error.interceptor.ts",
+              "an `HttpInterceptorFn` that surfaces a readable message"),
+    ]
+    if prof.authentication:
+        entries.insert(0, Entry(
+            "frontend/src/app/guards/auth.guard.ts",
+            "a `CanActivateFn` that redirects an unauthenticated visitor to the "
+            "sign-in route"))
+        entries.append(Entry(
+            "frontend/src/app/guards/guest.guard.ts",
+            "keeps a signed-in user off the sign-in and registration routes"))
+        entries.append(Entry(
+            "frontend/src/app/interceptors/auth.interceptor.ts",
+            "an `HttpInterceptorFn` that attaches the bearer token"))
+    if prof.roles:
+        entries.append(Entry(
+            "frontend/src/app/guards/role.guard.ts",
+            "a `CanActivateFn` factory taking the allowed roles from the route's "
+            "`data`"))
+    return entries
+
+
+def guards(spec: str, prof: Profile) -> str:
+    if not prof.authentication:
+        # No accounts: there is nothing to guard.
+        #
+        # Note what this text does NOT do — it never mentions guards, tokens or
+        # sign-in, not even to forbid them. A negative instruction ("do not
+        # generate a login screen") raises the idea's salience, and small models
+        # reliably produce the thing they were told to leave out. Describing
+        # only the one file that is wanted makes the omission the natural
+        # reading rather than a prohibition to work around.
+        focus = """\
+## This stage
+
+This application needs one HTTP interceptor and nothing else.
+
+The error interceptor is an `HttpInterceptorFn`, registered later through
+`provideHttpClient(withInterceptors([...]))`. It turns a failed response into a
+message a person can read, preserving the `message` and `fieldErrors` the
+backend sent, and it lets the error continue to propagate so components can
+react to it themselves.
+
+Produce exactly the file listed in the output contract below.
 """
-    return _assemble(
-        "# Task: generate the guards and HTTP interceptors",
-        "You are a senior Angular engineer with a security focus. You answer "
-        "with code and nothing else.",
-        _stack(),
-        """\
+    else:
+        rules = [
+            "A guard that blocks navigation returns a `UrlTree` from "
+            "`Router.createUrlTree` rather than calling `navigate` and returning "
+            "`false`. That is what makes the redirect atomic.",
+            "The auth guard preserves the attempted URL as a `returnUrl` query "
+            "parameter, so the user lands where they were going after signing in.",
+            "The auth interceptor attaches the token only to requests aimed at "
+            "`environment.apiUrl`. It must not attach it to third-party requests.",
+            "The error interceptor treats 401 as \"the session is gone\": clear it "
+            "and send the user to sign in.",
+        ]
+        if prof.roles:
+            rules.insert(2, "The role guard reads its allowed roles from "
+                            "`route.data['roles']`, so one guard serves every "
+                            "restricted route.")
+            rules.append("The error interceptor must **not** sign the user out on "
+                         "403, which means the session is valid but the action is "
+                         "not permitted.")
+        body = "\n".join(f"- {rule}" for rule in rules)
+        focus = f"""\
 ## This stage
 
 All guards are **functional** — `export const authGuard: CanActivateFn = (route, state) => ...`
@@ -363,37 +474,86 @@ through `provideHttpClient(withInterceptors([...]))`.
 
 Requirements:
 
-- A guard that blocks navigation returns a `UrlTree` from `Router.createUrlTree`
-  rather than calling `navigate` and returning `false`. That is what makes the
-  redirect atomic.
-- The auth guard preserves the attempted URL as a `returnUrl` query parameter,
-  so the user lands where they were going after signing in.
-- The role guard reads its allowed roles from `route.data['roles']`, so one
-  guard serves every restricted route.
-- The auth interceptor attaches the token only to requests aimed at
-  `environment.apiUrl`. It must not attach it to third-party requests.
-- The error interceptor treats 401 as "the session is gone": clear it and send
-  the user to sign in. It must not do that for 403, which means the session is
-  valid but the action is not permitted.
+{body}
 
 **State this clearly in a comment at the top of the guard file:** guards are a
 convenience for the user, not a security boundary. Anyone can edit the bundle.
 The server is what enforces access, and the specification's authorization
 scenarios test the server independently of anything the browser does.
-""",
+"""
+
+    return _assemble(
+        "# Task: generate the guards and HTTP interceptors",
+        "You are a senior Angular engineer with a security focus. You answer "
+        "with code and nothing else.",
+        _stack(prof),
+        focus,
         _hard_rules(),
-        _output_contract("frontend/src/app/", manifest),
+        _output_contract("frontend/src/app/", guards_manifest(prof)),
         _spec_block(spec),
         _code_block("Front-end services and models",
-                    context.collect_code(FRONTEND_SRC / "app" / "services",
-                                         FRONTEND_SRC / "app" / "models",
-                                         FRONTEND_SRC / "environments")),
-        _self_check(),
+                    context.collect_code(_frontend_src() / "app" / "services",
+                                         _frontend_src() / "app" / "models",
+                                         _frontend_src() / "environments")),
+        _self_check(prof),
     )
 
 
 # ======================================================= 5. components ====
-def components(spec: str, area: str = "", areas_done: str = "") -> str:
+def _component_rules(prof: Profile) -> str:
+    rules = [
+        "**Reactive forms** for anything with validation. Every validation rule "
+        "the specification states appears as a validator, and the message shown "
+        "is the one the specification names. Show a field's error only after it "
+        "is touched.",
+        "**Server errors are shown.** When a request fails with `fieldErrors`, "
+        "map them onto the matching form controls. A validation failure the user "
+        "cannot see is a broken screen.",
+        "**Three visible states** for anything that loads: in progress, loaded, "
+        "and empty. The empty state says why it is empty. A bare blank area is "
+        "not a state.",
+        "**Disabled means disabled.** Where the specification says a control is "
+        "disabled under a condition, bind `[disabled]` to that condition rather "
+        "than hiding the control.",
+    ]
+    if prof.search:
+        rules.append(
+            "**Tables** that the specification says are sortable sort on a header "
+            "click and toggle direction on a second click, with a visible "
+            "indicator of the current column and direction. Filters are applied "
+            "through the service, not by filtering an array in the component — "
+            "the server decides what matches.")
+    if prof.pagination:
+        rules.append(
+            "**Paging** keeps the current page in the URL as a query parameter, "
+            "so a reload and a shared link land on the same page.")
+    if prof.uploads:
+        rules.append(
+            "**File inputs** show the chosen file's name, enforce the same type "
+            "and size limits the server does so the user finds out before "
+            "uploading, and state that the server checks them again.")
+    if prof.scheduling:
+        rules.append(
+            "**Dates and times** are shown in the format the specification uses "
+            "and sent to the server as ISO strings. A picker never lets the user "
+            "choose a value the specification forbids.")
+    if prof.money:
+        rules.append(
+            "**Amounts** are formatted with exactly the number of decimal places "
+            "the specification states, and never recomputed in the browser — the "
+            "server's number is the number.")
+    rules.append(
+        "**Responsive.** Bootstrap's grid and utilities; usable at 375px wide "
+        "with no horizontal scrolling of the page body.")
+    rules.append(
+        "State is held in `signal()` and derived with `computed()`. "
+        "Subscriptions that outlive the component are cleaned up with "
+        "`takeUntilDestroyed`.")
+    return "\n".join(f"- {rule}" for rule in rules)
+
+
+def components(spec: str, prof: Profile, area: str = "",
+               areas_done: str = "") -> str:
     """
     `area` narrows the stage to one feature area.
 
@@ -429,9 +589,9 @@ the same thing.
         "You are a senior Angular engineer who builds clean, accessible, "
         "responsive interfaces with Bootstrap. You answer with code and "
         "nothing else.",
-        _stack(),
+        _stack(prof),
         focus,
-        """\
+        f"""\
 Each component lives in its own folder under `frontend/src/app/components/`
 and consists of exactly three files:
 
@@ -447,24 +607,7 @@ import; `FormsModule` or `ReactiveFormsModule` and `RouterLink` do.
 
 Requirements:
 
-- **Reactive forms** for anything with validation. Every validation rule the
-  specification states appears as a validator, and the message shown is the one
-  the specification names. Show a field's error only after it is touched.
-- **Server errors are shown.** When a request fails with `fieldErrors`, map them
-  onto the matching form controls. A validation failure the user cannot see is
-  a broken screen.
-- **Three visible states** for anything that loads: in progress, loaded, and
-  empty. The empty state says why it is empty. A bare blank area is not a state.
-- **Disabled means disabled.** Where the specification says a control is
-  disabled under a condition, bind `[disabled]` to that condition rather than
-  hiding the control.
-- **Tables** that the specification says are sortable sort on a header click and
-  toggle direction on a second click, with a visible indicator of the current
-  column and direction.
-- **Responsive.** Bootstrap's grid and utilities; usable at 375px wide with no
-  horizontal scrolling of the page body.
-- State is held in `signal()` and derived with `computed()`. Subscriptions that
-  outlive the component are cleaned up with `takeUntilDestroyed`.
+{_component_rules(prof)}
 """,
         already,
         _hard_rules(),
@@ -472,34 +615,65 @@ Requirements:
         _api_surface(),
         _spec_block(spec),
         _code_block("Front-end services, models and guards",
-                    context.collect_code(FRONTEND_SRC / "app" / "services",
-                                         FRONTEND_SRC / "app" / "models",
-                                         FRONTEND_SRC / "app" / "guards")),
+                    context.collect_code(_frontend_src() / "app" / "services",
+                                         _frontend_src() / "app" / "models",
+                                         _frontend_src() / "app" / "guards")),
         f"""\
 ## Components already on disk
 
 ```
-{context.describe_tree(FRONTEND_SRC / "app" / "components")}
+{context.describe_tree(_frontend_src() / "app" / "components")}
 ```
 """,
-        _self_check(),
+        _self_check(prof),
     )
 
 
 # ============================================================== 6. app ====
-def app_shell(spec: str) -> str:
-    manifest = """\
-- `frontend/src/app/app.ts` — the root standalone component
-- `frontend/src/app/app.html` — the shell: header, navigation, `<router-outlet />`, footer
-- `frontend/src/app/app.css`
-- `frontend/src/app/app.config.ts` — `ApplicationConfig` with the providers
-- `frontend/src/app/app.routes.ts` — the route table
-"""
+def app_manifest(prof: Profile) -> list[Entry]:
+    return [
+        Entry("frontend/src/app/app.ts", "the root standalone component"),
+        Entry("frontend/src/app/app.html",
+              "the shell: header, navigation, `<router-outlet />`, footer"),
+        Entry("frontend/src/app/app.css", "shell styles"),
+        Entry("frontend/src/app/app.config.ts",
+              "`ApplicationConfig` with the providers"),
+        Entry("frontend/src/app/app.routes.ts", "the route table"),
+    ]
+
+
+def app_shell(spec: str, prof: Profile) -> str:
+    interceptors = ("authInterceptor, errorInterceptor" if prof.authentication
+                    else "errorInterceptor")
+    if prof.authentication:
+        guard_lines = (
+            "- Guards applied per route"
+            + (", with allowed roles in `data: { roles: [...] }`."
+               if prof.roles else ".")
+            + "\n- Every route the specification names, at the exact path it "
+              "names. If the specification puts a privileged sign-in on its own "
+              "route, that route exists here and no navigation links to it.\n")
+        nav_lines = (
+            "- navigation whose items depend on "
+            + ("the signed-in role, read from the authentication service's signals"
+               if prof.roles else "whether someone is signed in")
+            + ",\n- a sign-out control whenever someone is signed in,\n")
+        nav_note = ("\nNavigation is built from the authentication signals, so it "
+                    "updates without a reload when someone signs in or out. Show "
+                    "only what that "
+                    + ("role" if prof.roles else "visitor")
+                    + " may reach.\n")
+    else:
+        guard_lines = ("- Every route the specification names, at the exact path "
+                       "it names. Every route is reachable by anyone.\n")
+        nav_lines = "- navigation to every area of the application,\n"
+        nav_note = ""
+
     return _assemble(
         "# Task: generate the application shell, routes and providers",
         "You are a senior Angular engineer. You answer with code and nothing else.",
-        _stack(),
-        """\
+        _stack(prof),
+        f"""\
 ## This stage
 
 This is the **final** front-end stage. Wire together everything that already
@@ -507,12 +681,8 @@ exists.
 
 `app.routes.ts`:
 
-- Every route the specification names, at the exact path it names. If the
-  specification puts an administrator sign-in on its own route, that route
-  exists here and no navigation links to it.
-- Lazy-loaded with `loadComponent`, so a visitor does not download screens
-  their role cannot reach.
-- Guards applied per route, with allowed roles in `data: { roles: [...] }`.
+{guard_lines}- Lazy-loaded with `loadComponent`, so a visitor does not download screens
+  they cannot reach.
 - Order matters: a literal path before a parameterised one that would also
   match it.
 - A wildcard `**` route last, showing a not-found view that keeps the shell.
@@ -521,39 +691,56 @@ exists.
 
 ```ts
 provideRouter(routes, withComponentInputBinding()),
-provideHttpClient(withInterceptors([authInterceptor, errorInterceptor])),
-provideZoneChangeDetection({ eventCoalescing: true }),
+provideHttpClient(withInterceptors([{interceptors}])),
+provideZoneChangeDetection({{ eventCoalescing: true }}),
 ```
 
 `app.html` is the shell every page sits inside:
 
 - a header with the application name,
-- navigation whose items depend on the signed-in role, read from the
-  authentication service's signals,
-- a sign-out control whenever someone is signed in,
-- `<router-outlet />`,
+{nav_lines}- `<router-outlet />`,
 - a footer.
-
-Navigation is built from the role signals, so it updates without a reload when
-someone signs in or out. Show only what that role may reach.
-
+{nav_note}
 Do **not** generate `package-lock.json`, and do not generate a binary
 `favicon.ico` — reference `favicon.ico` from `index.html` and leave the file to
 be added by hand.
 """,
         _hard_rules(),
-        _output_contract("frontend/src/app/", manifest),
+        _output_contract("frontend/src/app/", app_manifest(prof)),
         _spec_block(spec),
         _code_block("Front-end guards, interceptors and services",
-                    context.collect_code(FRONTEND_SRC / "app" / "guards",
-                                         FRONTEND_SRC / "app" / "interceptors",
-                                         FRONTEND_SRC / "app" / "services")),
+                    context.collect_code(_frontend_src() / "app" / "guards",
+                                         _frontend_src() / "app" / "interceptors",
+                                         _frontend_src() / "app" / "services")),
         f"""\
 ## Components available to route to
 
 ```
-{context.describe_tree(FRONTEND_SRC / "app" / "components")}
+{context.describe_tree(_frontend_src() / "app" / "components")}
 ```
 """,
-        _self_check(),
+        _self_check(prof),
     )
+
+
+# ============================================================= stages ======
+@dataclass(frozen=True)
+class Stage:
+    name: str
+    build: Callable[[str, Profile], str]
+    minimum: Callable[[Profile], int]
+
+
+# The components stage is not here: it runs once per feature area and is driven
+# by pipeline.build_frontend directly.
+STAGES: list[Stage] = [
+    Stage("frontend-1-scaffold", scaffold,
+          lambda p: minimum(scaffold_manifest(p))),
+    Stage("frontend-2-models",   models,   _entity_floor),
+    Stage("frontend-3-services", services, _entity_floor),
+    Stage("frontend-4-guards",   guards,
+          lambda p: minimum(guards_manifest(p))),
+]
+
+FINAL_STAGE = Stage("frontend-6-app", app_shell,
+                    lambda p: minimum(app_manifest(p)))

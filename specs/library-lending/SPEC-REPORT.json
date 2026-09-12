@@ -1,0 +1,32 @@
+{
+  "model": "gemma4:31b:cloud",
+  "brief": "C:\\Users\\boris\\Desktop\\Projekat\\briefs\\library-lending.md",
+  "capabilities": 18,
+  "rounds_used": 1,
+  "first_attempt_valid": false,
+  "valid": true,
+  "issues": [],
+  "metrics": {
+    "files": 7,
+    "areas": 5,
+    "features": 7,
+    "scenarios": 30,
+    "scenario_outlines": 3,
+    "scenarios_total": 33,
+    "examples_rows": 12,
+    "steps": 128,
+    "distinct_steps": 86,
+    "step_reuse": 1.49,
+    "steps_per_scenario": 3.9,
+    "positive": 21,
+    "negative": 12,
+    "untagged_polarity": 0,
+    "negative_share": 0.36,
+    "ui_tagged": 20,
+    "capabilities_total": 18,
+    "capabilities_covered": 18,
+    "capability_coverage": 1.0,
+    "capabilities_missing": []
+  },
+  "generated_at": "2026-09-12T11:33:19.111978+00:00"
+}

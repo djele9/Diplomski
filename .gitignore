@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+apps/
+runs/
+.idea/
+*.pyc
